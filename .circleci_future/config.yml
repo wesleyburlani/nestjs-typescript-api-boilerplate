@@ -1,0 +1,125 @@
+version: 2.1
+
+staging_only: &staging_only
+  filters:
+    branches:
+      only:
+        - staging
+
+master_and_staging_only: &master_and_staging_only
+  filters:
+    branches:
+      only:
+        - master
+        - staging
+
+master_and_staging_ignore: &master_and_staging_ignore
+  filters:
+    branches:
+      ignore:
+        - master
+        - staging
+
+master_only: &master_only
+  filters:
+    branches:
+      only: master
+
+orbs:
+  slack: circleci/slack@4.8.3
+
+export_modified_files: &export_modified_files
+  name: "export list of modified files"
+  command: echo 'export MODIFIED_FILES="$(git diff --name-only << pipeline.git.base_revision >> << pipeline.git.revision >>)"' >> $BASH_ENV
+
+workflows:
+  build:
+    jobs:
+      - build:
+          <<: *master_and_staging_only
+          context: build
+      - deploy-preprod-gke:
+          <<: *staging_only
+          context: deploy-preprod-gke
+          requires:
+            - build
+      - deploy-prod-gke:
+          <<: *master_only
+          context: deploy-prod-gke
+          requires:
+            - build
+  test:
+    jobs:
+      - test:
+          <<: *master_and_staging_only
+          context: test
+
+jobs:
+  build:
+    docker:
+      - image: cimg/node:17-alpine
+    steps:
+      - checkout
+      - run:
+          <<: *export_modified_files
+      - setup_remote_docker
+      # build and push Docker image
+      - run: |
+         IMAGE="registry.gitlab.com/tldx/browser"
+          echo $REGISTRY_PASSWORD | docker login -u circleci --password-stdin registry.gitlab.com
+          docker pull $IMAGE/transcripts-api:latest || true
+          docker build --tag="$IMAGE/transcripts-api:<< pipeline.git.revision >>" --tag="$IMAGE/transcripts-api:latest" ./transcripts-api
+          docker push $IMAGE/transcripts-api:<< pipeline.git.revision >>
+          docker push $IMAGE/transcripts-api:latest
+      - slack/notify:
+          event: pass
+          template: basic_success_1
+
+  deploy-preprod-gke:
+    docker:
+      - image: alpine/helm:3.2.0
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: |
+          apk add --no-cache curl
+          echo "$K8S_CA_CRT" | base64 -d > /etc/ssl/certs/ca.crt
+          helm get values preprod-transcripts-api  > values.yaml
+          helm upgrade preprod-transcripts-api -f values.yaml --set image.tag=${CIRCLE_SHA1} ./charts/preprod-transcripts-api
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+
+  deploy-prod-gke:
+    docker:
+      - image: alpine/helm:3.2.0
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run: |
+          apk add --no-cache curl
+          echo "$K8S_CA_CRT" | base64 -d > /etc/ssl/certs/ca.crt
+          helm get values prod-transcripts-api > values.yaml
+          helm upgrade prod-transcripts-api -f values.yaml --set image.tag=${CIRCLE_SHA1} ./charts/transcripts-api
+      - slack/notify:
+          event: fail
+          template: basic_fail_1
+      - slack/notify:
+          event: pass
+          template: success_tagged_deploy_1
+
+  test:
+    docker:
+      - image: circleci/node:17-alpine
+    steps:
+      - checkout
+      - run:
+          name: Install Dependencies
+          command: npm install
+      - run:
+          name: Unit Tests
+          command: npm run test
+
